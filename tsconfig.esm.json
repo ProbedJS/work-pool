@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+        "sourceMap": true,
+        "moduleResolution": "node",
+        "allowSyntheticDefaultImports": true,
+        "esModuleInterop": true,
+        "strict": true,
+        "declaration": true,
+        "module": "esnext",
+        "outDir": "lib/esm",
+        "target": "es2018",
+        "lib": [
+            "es2018"
+        ],
+        "newLine": "lf",
+    },
+    "files": [
+        "./src/index.ts",
+        "./src/worker.ts"
+    ],
+  }

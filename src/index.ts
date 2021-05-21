@@ -15,66 +15,82 @@
  */
 
 import {
+  ADD_TASK_TYPE,
   AddTaskMsg,
-  MsgFromWorker,
-  MsgToWorker,
+  EXIT_TYPE,
+  MsgBase,
+  MsgMsg,
+  READY_TYPE,
+  TASK_COMPLETION_TYPE,
   TaskCompletion,
-  TaskDiscovery,
-  TaskFailure,
-  TaskWorker,
   WorkerConfig,
 } from './worker.js';
 
+import { performance } from 'perf_hooks';
 import { EventEmitter } from 'events';
 import os from 'os';
-import { MessageChannel, MessagePort, Worker } from 'worker_threads';
-import workerModule from './worker-location.js'
+import { MessagePort, Worker } from 'worker_threads';
+import workerModule from './worker-location.js';
 
-type Affinity = 0 | 1 | 2;
-const AFFINITY_LIGHT = 0;
-const AFFINITY_STRONG = 1;
-const AFFINITY_FORCE = 2;
+/** A flat amount added to all tasks.  */
+const BASE_TASK_COST = 1;
+
+const MAIN_THREAD_ID = -1;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type UserContent = any;
 
 /** Interface available both in the main thread and workers. */
-export interface ITaskPool<T> {
-  addTask(arg: T, options?: TaskOptions): void;
+export interface IWorkerClient<T> {
+  postMessageToPool(type: string, contents: UserContent): void;
+  onMessage(
+    type: string,
+    handler: (contents: UserContent, client: IWorkerClient<T>) => void
+  ): void;
 }
-
-/** Task processing entrypoint. */
-export type ProcessFunc<T, U> = (arg: T, pool: ITaskPool<T>) => U | Promise<U>;
 
 /** Options that can be passed when adding a task. */
 export interface TaskOptions {
-  /** Prefer running on that specific worker. This is implicitely set when
-   * adding a task from within a worker.
-   */
-  workerAffinity?: 'main' | number;
+  /** If set, the task will run on the main thread. */
+  mainThread?: boolean;
 
-  /** How much effort should be put into respecting workerAffinity.
-   * - 0 (or unset): The work can be stolen without hesitation.
-   * - 1 The work might be stolen under certain circumstances.
-   * - 2 The work will never be stolen under any circumstances.
-   *
-   * force is always implied when the affinity is 'main'
-   */
-  affinityStrength?: Affinity;
+  /** A deterministic identifier for that task. Leads to better task dispatching over multiple runs. */
+  key?: string;
+
+  /** Addition info tagged onto the task. */
+  meta?: UserContent;
 }
 
 export interface IWorker {
-  readonly id: string;
+  readonly id: number;
+  postMessageToWorker(type: string, contents?: UserContent): void;
+}
+
+/** Worker entrypoint */
+export interface WorkerEntryPoint<T, U> {
+  (arg: T, client: IWorkerClient<T>): Promise<U>;
+
+  /** Work performed here will count as worker overhead, and NOT as intrinsic cost. */
+  preTask?: (arg: T, client: IWorkerClient<T>) => void;
+
+  onWorkerStart?: (client: IWorkerClient<T>) => void | Promise<void>;
+  onWorkerExit?: (client: IWorkerClient<T>) => void | Promise<void>;
 }
 
 /** A task that has been added to the worker pool. */
 export interface Task<T, U> extends PromiseLike<U> {
-  readonly arg: T;
-  readonly id: string;
+  readonly argument: T;
+  readonly id: number;
   readonly options: TaskOptions;
   readonly worker?: IWorker;
+
+  readonly taskCost: number;
+  readonly pretaskCost: number;
 }
 
 /** Options that can be passed to a worker pool at construction. */
 export interface WorkerPoolOptions<T, U> {
-  /** Name of the exported symbol to use in the entrypoint module. Default: 'processTask' */
+  /** Name of the exported symbol to use in the entrypoint module. Default: 'workerEntrypoint' */
   entrypointSymbol: string;
 
   /** New workers are launched when the ratio of pending tasks to workers goes above this threshold. Default: 3 */
@@ -83,20 +99,30 @@ export interface WorkerPoolOptions<T, U> {
   /** Absolute maximum number of workers to launch. Default: cpu count */
   maxWorkers: number;
 
-  /** How many tasks can be queued in each worker's backends. Lower = better load balancing. Higher = better pipelining. Default: 2.*/
+  /** How many tasks can be sent at a time to each worker. Lower -> better load balancing. Higher -> better pipelining. Default: 2.*/
   workerConcurency: number;
 
-  /** Task processing's entrypoint function. (useful for type inference) */
-  entryPoint?: ProcessFunc<T, U>;
+  /** Function that returns an estimate of the cost (in ms) associated with running a task on a given worker.*/
+  inherentCostEstimator: (task: Task<T, U>) => number;
+  workerCostEstimator: (task: Task<T, U>, worker: IWorker) => number;
+
+  /** Task processing's entrypoint function. */
+  entryPoint?: WorkerEntryPoint<T, U>;
 }
 
 /** A pool of worker threads dedicated to processing tasks of the (T)=>U form. */
 export interface WorkerPool<T, U> {
+  /** Wether or not there is work currently queued and/or being processed. */
   readonly isIdle: boolean;
 
+  /** Add a task to be processed. There is no guarantee that tasks will be executed in order.*/
   addTask(arg: T, options?: TaskOptions): Task<T, U>;
 
+  /** Register a handler that is called whenever a task is added to the pool. */
   on(event: 'task-added', listener: (task: Task<T, U>) => void): this;
+  on(event: 'worker-launched', listener: (worker: IWorker) => void): this;
+
+  /** Register a handler that is called whenever a task is done. */
   on(
     event: 'task-complete',
     listener: (
@@ -106,9 +132,47 @@ export interface WorkerPool<T, U> {
     ) => void
   ): this;
 
+  removeListener(
+    event: 'task-added',
+    listener: (task: Task<T, U>) => void
+  ): this;
+
+  removeListener(
+    event: 'worker-launched',
+    listener: (worker: IWorker) => void
+  ): this;
+
+  removeListener(
+    event: 'task-complete',
+    listener: (
+      err: Error | undefined,
+      result: U | undefined,
+      task: Task<T, U>
+    ) => void
+  ): this;
+
+  /** Register a handler that is called whenever a message with the provided type is sent from a worker. */
+  onMessage(
+    type: string,
+    listener: (msg: UserContent, origin: IWorker) => void
+  ): this;
+
+  removeMessageListener(
+    event: string,
+    listener: (...args: any[]) => void
+  ): this;
+
+  /** Sends a message to every **current** worker. */
+  postMessageToWorkers(type: string, contents?: UserContent): void;
+
+  /** Clean up. */
   dispose(): void;
 
+  /** Gets a promise that resolves when every queued task has been completed. */
   whenIdle(): Promise<void>;
+
+  /** Increases the current number of launchers. */
+  resizeUpTo(upTo: number): void;
 }
 
 export interface WorkerPoolConstructor {
@@ -119,7 +183,6 @@ export interface WorkerPoolConstructor {
 }
 
 interface WorkerClientOptions {
-  eager: boolean;
   maxConcurency: number;
 }
 
@@ -128,95 +191,105 @@ const WORKER_STARTING = 0;
 const WORKER_READY = 1;
 const WORKER_DISPOSED = 2;
 
-class WorkerClient<T, U> implements IWorker {
-  id: string;
+class ClientBase {
+  _next!: ClientBase;
+  _prev!: ClientBase;
+  load: number;
 
-  _options: WorkerClientOptions;
-  _port: MessagePort | Worker;
-  _pool: WorkerPoolImpl<T, U>;
+  constructor(load: number) {
+    this.load = load;
+  }
 
-  ownedTasks = 0;
-  tasksDispatched = 0;
-  _queues: TaskImpl<T, U>[][] = [[], [], []];
+  postMessageToWorker(_type: string, _contents?: UserContent): void {
+    // Intentionally empty
+  }
 
-  _activeTasks: Record<string, TaskImpl<T, U>> = {};
+  dispose(): void {
+    // Intentionally empty
+  }
 
-  status: WorkerStatus = WORKER_STARTING;
+  _shouldAdvance(): boolean {
+    return this._next.load !== -1 && this.load > this._next.load;
+  }
 
+  _shouldRetreat(): boolean {
+    return this._prev.load !== -1 && this.load < this._prev.load;
+  }
+
+  _resort(): void {
+    if (this._shouldAdvance()) {
+      // Yank out the node.
+      this._next._prev = this._prev;
+      this._prev._next = this._next;
+
+      // Advance until we find where we belong.
+      this._next = this._next._next;
+      while (this._shouldAdvance()) {
+        this._next = this._next._next;
+      }
+
+      // Insert ourselves.
+      this._prev = this._next._prev;
+      this._next._prev = this;
+      this._prev._next = this;
+    } else if (this._shouldRetreat()) {
+      this._prev._next = this._next;
+      this._next._prev = this._prev;
+
+      while (this._shouldRetreat()) {
+        this._prev = this._prev._prev;
+      }
+      this._next = this._prev._next;
+      this._next._prev = this;
+      this._prev._next = this;
+    }
+  }
+}
+
+abstract class Client<T, U> extends ClientBase implements IWorker {
   constructor(
     pool: WorkerPoolImpl<T, U>,
-    port: MessagePort | Worker,
     options: WorkerClientOptions,
-    id: string
+    id: number
   ) {
+    super(0);
     this.id = id;
     this._options = options;
-    this._port = port;
     this._pool = pool;
-
-    port.on('message', (msg) => this._recv(msg));
   }
+
+  abstract _onAddTask(msg: AddTaskMsg<T>): void;
 
   dispose() {
     this.status = WORKER_DISPOSED;
-    this._post({ type: 'exit' });
   }
 
-  _recv(msg: MsgFromWorker) {
-    if (this.status === WORKER_DISPOSED) return;
-
-    switch (msg.type) {
-      case 'ready':
-        this.status = WORKER_READY;
-        this._flush();
-        break;
-      case 'task-complete':
-        this._complete(msg as TaskCompletion<U>);
-        break;
-      case 'task-failed':
-        this._fail(msg as TaskFailure);
-        break;
-      case 'task-discovered':
-        this._discover(msg as TaskDiscovery<T>);
-        break;
-    }
-  }
-
-  _post(msg: MsgToWorker) {
-    this._port.postMessage(msg);
-  }
-
-  _finish(id: string): TaskImpl<T, U> {
-    this.ownedTasks -= 1;
-    this.tasksDispatched -= 1;
-    const task = this._activeTasks[id];
-    delete this._activeTasks[id];
+  _ready() {
+    this.status = WORKER_READY;
     this._flush();
-    return task;
   }
 
   _complete(msg: TaskCompletion<U>) {
-    const task = this._finish(msg.id);
+    const task = this._pool._tasks.get(msg.id)!;
 
-    task.doresolve(msg.result);
-    this._pool._completed(task, msg.result);
-  }
+    this.ownedTasks -= 1;
+    this.tasksDispatched -= 1;
+    this.load -= task.taskCost + task.pretaskCost + BASE_TASK_COST;
+    this._resort();
 
-  _fail(msg: TaskFailure) {
-    const task = this._finish(msg.id);
+    task.taskCost = msg.taskCost;
+    task.pretaskCost = msg.pretaskCost;
 
-    task.doreject(msg.error);
-    this._pool._failed(task, msg.error);
-  }
+    this._pool._completed(task, msg.error, msg.result);
 
-  _discover(msg: TaskDiscovery<T>) {
-    this._pool._registerTask(msg.id, msg.arg, msg.options);
+    this._flush();
   }
 
   _enqueue(task: TaskImpl<T, U>) {
     this.ownedTasks += 1;
-    const qid = task.options.affinityStrength || 0;
-    this._queues[qid].push(task);
+    this.load += task.taskCost + task.pretaskCost + BASE_TASK_COST;
+    this._resort();
+    this._queue.push(task);
     this._flush();
   }
 
@@ -225,41 +298,144 @@ class WorkerClient<T, U> implements IWorker {
       this.status === WORKER_READY &&
       this.tasksDispatched < this._options.maxConcurency
     ) {
-      let next = this._queues[AFFINITY_FORCE].pop();
+      const next = this._queue.shift();
 
-      if (next === undefined) {
-        next = this._queues[AFFINITY_STRONG].pop();
+      if (next) {
+        this.tasksDispatched += 1;
+        next.worker = this;
+
+        const msg: AddTaskMsg<T> = {
+          id: next.id,
+          arg: next.argument,
+          options: next.options,
+        };
+        this._onAddTask(msg);
+      } else {
+        break;
       }
-
-      if (next === undefined) {
-        next = this._queues[AFFINITY_LIGHT].pop();
-      }
-
-      if (next === undefined && this._options.eager) {
-        next = this._pool._findTask();
-        if (next) this.ownedTasks += 1;
-      }
-
-      if (next === undefined) {
-        if (this.tasksDispatched === 0) {
-          this._pool._notifyIdle(this);
-        }
-        return;
-      }
-
-      this.tasksDispatched += 1;
-      next.worker = this;
-      this._activeTasks[next.id] = next;
-
-      const msg: AddTaskMsg<T> = {
-        type: 'add-task',
-        id: next.id,
-        options: next.options,
-        arg: next.arg,
-      };
-      this._post(msg);
     }
   }
+
+  id: number;
+  ownedTasks = 0;
+  tasksDispatched = 0;
+  status: WorkerStatus = WORKER_STARTING;
+
+  _pool: WorkerPoolImpl<T, U>;
+  _options: WorkerClientOptions;
+
+  _queue: TaskImpl<T, U>[] = [];
+}
+
+class WorkerClient<T, U> extends Client<T, U> {
+  _port: MessagePort | Worker;
+
+  constructor(
+    pool: WorkerPoolImpl<T, U>,
+    port: Worker,
+    options: WorkerClientOptions,
+    id: number
+  ) {
+    super(pool, options, id);
+    this._port = port;
+
+    port.on('message', (msg) => this._recv(msg));
+  }
+
+  dispose() {
+    this._port.postMessage({ type: EXIT_TYPE });
+    super.dispose();
+  }
+
+  postMessageToWorker(type: string, contents?: UserContent): void {
+    this._port.postMessage({ type, contents });
+  }
+
+  _recv(msg: MsgBase) {
+    if (this.status === WORKER_DISPOSED) return;
+
+    switch (msg.type) {
+      case READY_TYPE:
+        this._ready();
+        break;
+      case TASK_COMPLETION_TYPE:
+        this._complete((msg as unknown) as TaskCompletion<U>);
+        break;
+      default:
+        this._pool._recvMsg(msg as MsgMsg, this);
+        break;
+    }
+  }
+
+  _onAddTask(msg: AddTaskMsg<T>) {
+    this._port.postMessage({ type: ADD_TASK_TYPE, ...msg });
+  }
+}
+
+class MainThreadClient<T, U> extends Client<T, U> implements IWorkerClient<T> {
+  constructor(pool: WorkerPoolImpl<T, U>, options: WorkerClientOptions) {
+    super(pool, options, MAIN_THREAD_ID);
+
+    this._next = this;
+    this._prev = this;
+    import(pool._entrypointModule).then(async (mod) => {
+      this._entry = mod[pool._options.entrypointSymbol];
+
+      if (this._entry!.onWorkerStart) {
+        await this._entry!.onWorkerStart(this);
+      }
+      this._ready();
+    });
+  }
+
+  onMessage(
+    type: string,
+    listener: (contents: UserContent, client: IWorkerClient<T>) => void
+  ): void {
+    this._eventsEmmiter.on(type, listener);
+  }
+
+  postMessageToPool(type: string, contents: UserContent): void {
+    const msg: MsgMsg = { type, contents };
+    this._pool._recvMsg(msg, this);
+  }
+
+  postMessageToWorker(type: string, contents?: UserContent): void {
+    this._recvMessageToWorker(type, contents);
+  }
+
+  _recvMessageToWorker(type: string, contents: UserContent): void {
+    this._eventsEmmiter.emit(type, contents, this);
+  }
+
+  async _onAddTask(msg: AddTaskMsg<T>) {
+    const { arg, options, id } = msg;
+    let taskCost = 0;
+    let pretaskCost = 0;
+
+    if (this._entry!.preTask) {
+      const startTime = performance.now();
+      await this._entry!.preTask(arg, this);
+      pretaskCost = performance.now() - startTime;
+    }
+
+    const startTime = performance.now();
+    const rawResult = this._entry!(arg, this);
+
+    rawResult.then(
+      (result) => {
+        taskCost = performance.now() - startTime;
+        this._complete({ id, options, result, taskCost, pretaskCost });
+      },
+      (error) => {
+        taskCost = performance.now() - startTime;
+        this._complete({ id, options, error, taskCost, pretaskCost });
+      }
+    );
+  }
+
+  _entry?: WorkerEntryPoint<T, U>;
+  _eventsEmmiter: EventEmitter = new EventEmitter();
 }
 
 /** A pool of workers capable of performing work. */
@@ -271,41 +447,28 @@ class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
     this._entrypointModule = entrypointModule;
     this._options = {
       maxWorkers: os.cpus().length,
+      inherentCostEstimator: () => 0,
+      workerCostEstimator: () => 0,
       workerConcurency: 2,
       taskPerWorker: 3,
-      entrypointSymbol: 'processTask',
+      entrypointSymbol: 'workerEntrypoint',
 
       ...opts,
     };
 
-    // If we exist, we'll need at least one worker...
-    this._launchWorker();
+    const canaryNode = new ClientBase(-1);
+    canaryNode._next = canaryNode;
+    canaryNode._prev = canaryNode;
+    this._workers = canaryNode;
 
-    // And launch the main thread worker. This is a bit wasteful in many cases,
-    // but doing this unconditionally removes a bunch of null checks.
-    const { port1, port2 } = new MessageChannel();
-    const mainWorkerCfg: WorkerConfig = {
-      entrypointModule: this._entrypointModule,
-      entrypointSymbol: this._options.entrypointSymbol,
-      workerId: 'main',
-    };
-
-    new TaskWorker(mainWorkerCfg, port1);
-
-    this._mainThreadWorkerClient = new WorkerClient(
-      this,
-      port2,
-      {
-        eager: false,
-        maxConcurency: this._options.workerConcurency,
-      },
-      'main'
-    );
+    this._mainThreadWorker = new MainThreadClient(this, {
+      maxConcurency: this._options.workerConcurency,
+    });
   }
 
   /** Will only be true if all work queued and discovered so far has been completed. */
   get isIdle(): boolean {
-    return this._ownedTasks === 0;
+    return this._tasks.size === 0;
   }
 
   on(event: string, listener: (...args: any[]) => void): this {
@@ -313,79 +476,124 @@ class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
     return this;
   }
 
-  emit(event: string, ...args: any[]): boolean {
-    return this._eventsEmmiter.emit(event, ...args);
+  removeListener(event: string, listener: (...args: any[]) => void): this {
+    this._eventsEmmiter.removeListener(event, listener);
+    return this;
+  }
+
+  onMessage(event: string, listener: (...args: any[]) => void): this {
+    this._msgEventsEmmiter.on(event, listener);
+    return this;
+  }
+
+  removeMessageListener(
+    event: string,
+    listener: (...args: any[]) => void
+  ): this {
+    this._msgEventsEmmiter.removeListener(event, listener);
+    return this;
+  }
+
+  /** Sends a message to all currently active workers. This does NOT wait for the task queue to be empty. */
+  postMessageToWorkers(type: string, contents?: UserContent): void {
+    this._mainThreadWorker.postMessageToWorker(type, contents);
+
+    let current = this._workers._next;
+    while (current != this._workers) {
+      current.postMessageToWorker(type, contents);
+      current = current._next;
+    }
   }
 
   /** Add a task to be performed. */
   addTask(arg: T, opts?: TaskOptions): TaskImpl<T, U> {
-    const id = (this._nextTaskId++).toString();
-    return this._registerTask(id, arg, opts || {});
+    return this._registerTask(this._nextTaskId++, arg, opts || {});
   }
 
-  _registerTask(id: string, arg: T, options: TaskOptions): TaskImpl<T, U> {
-    this._ownedTasks += 1;
+  _chooseWorker(task: TaskImpl<T, U>): WorkerClient<T, U> {
+    const workerEstimator = this._options.workerCostEstimator;
+
+    let taskCost: number;
+    if (task.options.key) {
+      taskCost =
+        this._costCache.get(task.options.key) ||
+        this._options.inherentCostEstimator(task);
+    } else {
+      taskCost = this._options.inherentCostEstimator(task);
+    }
+
+    let result = this._workers._next as WorkerClient<T, U>;
+    let pretaskCost = workerEstimator(task, result);
+    let resultNewLoad = result.load + taskCost + pretaskCost;
+
+    // We know the following:
+    // - inherentCost is fixed.
+    // - result.load can only increase, or stay the same.
+    // - workerCost can become literaly anything.
+    while (result._next !== this._workers) {
+      const candidate = result._next as WorkerClient<T, U>;
+
+      const candidatePretaskCost = workerEstimator(task, candidate);
+      const candidateNewLoad = candidate.load + taskCost + candidatePretaskCost;
+      if (candidateNewLoad < resultNewLoad) {
+        result = candidate;
+        pretaskCost = candidatePretaskCost;
+        resultNewLoad = candidateNewLoad;
+      } else {
+        // There might be a remaining worker who's estimate is better, but it
+        // cannot possibly overcome the load difference.
+        break;
+      }
+    }
+
+    task.taskCost = taskCost;
+    task.pretaskCost = pretaskCost;
+
+    return result;
+  }
+
+  _registerTask(id: number, arg: T, options: TaskOptions): TaskImpl<T, U> {
+    const newTask = new TaskImpl<T, U>(id, options, arg);
+    this._tasks.set(id, newTask);
 
     if (
-      this._workers.length < this._options.maxWorkers &&
-      this._ownedTasks - this._mainThreadWorkerClient.ownedTasks >
-        this._workers.length * this._options.taskPerWorker
+      this._numWorkers < this._options.maxWorkers &&
+      this._tasks.size - this._mainThreadWorker.ownedTasks >
+        this._numWorkers * this._options.taskPerWorker
     ) {
       this._launchWorker();
     }
 
-    const newTask = new TaskImpl<T, U>(id, options, arg);
-    const assignee = this._chooseWorker(newTask);
-    if (assignee) {
-      assignee._enqueue(newTask);
-    } else {
-      this._freeTasks.push(newTask);
+    if (options.mainThread) {
+      this._mainThreadWorker._enqueue(newTask);
+      this._eventsEmmiter.emit('task-added', newTask);
+      return newTask;
     }
 
-    this.emit('task-added', newTask);
+    const worker = this._chooseWorker(newTask);
+    worker!._enqueue(newTask);
 
-    if (this._idleWorkers.length > 0 && !this._stealing) {
-      // We intentionally use the slow-ish setTimeout in order to let backlogs pile up ever so slightly
-      this._stealing = setTimeout(() => this._stealWork(), 0);
-    }
-
+    this._eventsEmmiter.emit('task-added', newTask);
     return newTask;
   }
 
-  _completed(task: TaskImpl<T, U>, result: U): void {
-    this._ownedTasks -= 1;
-    this.emit('task-complete', undefined, result, task);
-  }
-
-  _failed(task: TaskImpl<T, U>, err: Error): void {
-    this._ownedTasks -= 1;
-    this.emit('task-complete', err, undefined, task);
-  }
-
-  dispose(): void {
-    this._workers.forEach((w) => w.dispose());
-    this._mainThreadWorkerClient.dispose();
-
-    if (this._stealing) {
-      clearTimeout(this._stealing);
+  _completed(
+    task: TaskImpl<T, U>,
+    error: Error | undefined,
+    result: U | undefined
+  ): void {
+    if (task.options.key) {
+      this._costCache.set(task.options.key, task.taskCost);
     }
-  }
 
-  /** Wait until the pool is not performing any work anymore. */
-  async whenIdle(): Promise<void> {
-    return new Promise((resolve) => {
-      if (this.isIdle) {
-        resolve();
-      } else {
-        this._onNextIdle.push(resolve);
-      }
-    });
-  }
-
-  _notifyIdle(worker: WorkerClient<T, U>): void {
-    if (worker._options.eager) {
-      this._idleWorkers.push(worker);
+    if (error) {
+      task._reject(error);
+    } else {
+      task._resolve(result!);
     }
+
+    this._tasks.delete(task.id);
+    this._eventsEmmiter.emit('task-complete', error, result, task);
 
     if (this.isIdle) {
       this._onNextIdle.forEach((cb) => cb());
@@ -393,149 +601,116 @@ class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
     }
   }
 
+  _recvMsg(msg: MsgMsg, origin: Client<T, U>): void {
+    this._msgEventsEmmiter.emit(msg.type, msg.contents, origin);
+  }
+
+  dispose(): void {
+    let current = this._workers._next;
+    while (current != this._workers) {
+      current.dispose();
+      current = current._next;
+    }
+    this._mainThreadWorker.dispose();
+  }
+
+  /** Wait until the pool is not performing any work anymore. */
+  whenIdle(): Promise<void> {
+    if (this.isIdle) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      this._onNextIdle.push(resolve);
+    });
+  }
+
   _launchWorker(): void {
     const data: WorkerConfig = {
       entrypointModule: this._entrypointModule,
       entrypointSymbol: this._options.entrypointSymbol,
-      workerId: this._workers.length,
     };
-    const worker = new Worker(workerModule, { workerData: data });
-    const client = new WorkerClient(
+
+    const newClient = new WorkerClient(
       this,
-      worker,
-      { eager: true, maxConcurency: this._options.workerConcurency },
-      this._workers.length.toString()
+      new Worker(workerModule, { workerData: data }),
+      { maxConcurency: this._options.workerConcurency },
+      this._numWorkers
     );
-    this._workers.push(client);
+
+    this._numWorkers += 1;
+    this._eventsEmmiter.emit('worker-launched', newClient);
+
+    // A fresh worker has no load, so it can go straight to the front of the list,
+    // no questions asked.
+    newClient._next = this._workers._next;
+    newClient._prev = this._workers;
+    newClient._next._prev = newClient;
+    newClient._prev._next = newClient;
   }
 
-  _chooseWorker(task: TaskImpl<T, U>): WorkerClient<T, U> | undefined {
-    const options: TaskOptions = task.options;
-    if (options.workerAffinity !== undefined) {
-      if (options.workerAffinity === 'main') {
-        return this._mainThreadWorkerClient;
-      } else {
-        return this._workers[options.workerAffinity];
-      }
-    }
-
-    return this._idleWorkers.pop();
-  }
-
-  _findTask(): TaskImpl<T, U> | undefined {
-    return this._freeTasks.pop();
-  }
-
-  _stealWork(): void {
-    // I am generally unhappy with this algorithm. especially wrt/ strong affinity.
-    // If a worker that had stuff stolen from them gets around to consuming from the free list
-    // while the stolen tasks are still there. They should be prioritized.
-    this._stealing = undefined;
-
-    // Check to see if the situation hasn't resolved itself.
-    if (this._idleWorkers.length === 0) return;
-
-    const stolen: TaskImpl<T, U>[] = [];
-    const concurency = this._options.workerConcurency;
-
-    let pressure = this._idleWorkers.length * concurency * 2;
-
-    // Only consider workers that are fully busy.
-    const workers = this._workers.filter((w) => w.ownedTasks >= concurency * 2);
-    workers.sort((a, b) => b.ownedTasks - a.ownedTasks);
-
-    // First pass: steal light affinity tasks
-    const candidateCount = workers.length;
-    for (let i = 0; i < candidateCount && pressure > 0; ++i) {
-      const w = workers[i];
-
-      const taken = w._queues[AFFINITY_LIGHT];
-      w._queues[AFFINITY_LIGHT] = [];
-
-      w.ownedTasks -= taken.length;
-      pressure -= taken.length;
-      stolen.push(...taken);
-    }
-
-    // second pass: steal strong affinity tasks
-    for (let i = 0; i < candidateCount && pressure > 0; ++i) {
-      const w = workers[i];
-
-      const taken = w._queues[AFFINITY_STRONG];
-      w._queues[AFFINITY_STRONG] = [];
-
-      w.ownedTasks -= taken.length;
-      pressure -= taken.length;
-      stolen.push(...taken);
-    }
-
-    this._freeTasks.push(...stolen);
-
-    this._flushIdlers();
-  }
-
-  _flushIdlers(): void {
-    const idlers = this._idleWorkers;
-    this._idleWorkers = [];
-
-    for (const i of idlers) {
-      i._flush();
+  resizeUpTo(upTo: number): void {
+    const workersToLaunch = Math.min(upTo, this._options.maxWorkers);
+    while (this._numWorkers < workersToLaunch) {
+      this._launchWorker();
     }
   }
-
-  _eventsEmmiter: EventEmitter = new EventEmitter();
 
   _options: WorkerPoolOptions<T, U>;
   _entrypointModule: string;
 
-  _mainThreadWorkerClient: WorkerClient<T, U>;
+  _eventsEmmiter: EventEmitter = new EventEmitter();
+  _msgEventsEmmiter: EventEmitter = new EventEmitter();
 
-  /** Ordered by id */
-  _workers: WorkerClient<T, U>[] = [];
+  _numWorkers = 0;
+  _workers: ClientBase; // An intrusive doubly-linked list with _workers being a canary node.
+  _mainThreadWorker: MainThreadClient<T, U>;
 
-  /** No particular order */
-  _idleWorkers: WorkerClient<T, U>[] = [];
-
-  // Pending tasks that have no particular worker affinity.
-  _freeTasks: TaskImpl<T, U>[] = [];
   _nextTaskId = 0;
-  _ownedTasks = 0;
+  _tasks: Map<number, TaskImpl<T, U>> = new Map();
 
   _onNextIdle: (() => void)[] = [];
-
-  _stealing?: NodeJS.Timeout;
+  _costCache: Map<string, number> = new Map();
 }
 
 class TaskImpl<T, U> implements PromiseLike<U>, Task<T, U> {
-  constructor(id: string, options: TaskOptions, arg: T) {
-    // TODO: This interaction with Promise<U> is janky as all heck.
-    // There's got to be a better way.
-    let tmpResolve: (value: U | PromiseLike<U>) => void;
-    let tmpReject: (reason?: Error) => void;
-
+  constructor(id: number, options: TaskOptions, arg: T) {
     this._prom = new Promise<U>((resolve, reject) => {
-      tmpResolve = resolve;
-      tmpReject = reject;
+      this._resolve = resolve;
+      this._reject = reject;
     });
 
     this.id = id;
+    this.argument = arg;
     this.options = options;
-    this.arg = arg;
-    this.doresolve = tmpResolve!;
-    this.doreject = tmpReject!;
   }
 
-  then<TResult1 = U, TResult2 = never>(onfulfilled?: ((value: U) => TResult1 | PromiseLike<TResult1>) | undefined | null, onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | undefined | null): PromiseLike<TResult1 | TResult2> {
+  then<TResult1 = U, TResult2 = never>(
+    onfulfilled?:
+      | ((value: U) => TResult1 | PromiseLike<TResult1>)
+      | undefined
+      | null,
+    onrejected?:
+      | ((reason: Error) => TResult2 | PromiseLike<TResult2>)
+      | undefined
+      | null
+  ): PromiseLike<TResult1 | TResult2> {
     return this._prom.then(onfulfilled, onrejected);
   }
-  
-  id: string;
-  worker?: IWorker;
+
+  id: number;
+  argument: T;
   options: TaskOptions;
-  arg: T;
+
+  worker?: IWorker;
+
+  taskCost = 0;
+  pretaskCost = 0;
+
+  /** Results handling */
   _prom: Promise<U>;
-  doresolve: (value: U | PromiseLike<U>) => void;
-  doreject: (reason?: Error) => void;
+  _resolve!: (value: U | PromiseLike<U>) => void;
+  _reject!: (reason?: Error) => void;
 }
 
 export const WorkerPool: WorkerPoolConstructor = WorkerPoolImpl;

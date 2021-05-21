@@ -28,7 +28,7 @@ extends:
 
 rules:
   "sort-imports": ["error", {"allowSeparatedGroups": true, "ignoreCase": true, "ignoreDeclarationSort" : true }]
-  "prettier/prettier": "error",
+  "prettier/prettier": "error"
   "@typescript-eslint/no-non-null-assertion": "off"
   "@typescript-eslint/no-explicit-any": ["error", { ignoreRestArgs: true }]
   "no-unused-vars": "off"

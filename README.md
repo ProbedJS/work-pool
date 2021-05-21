@@ -1,9 +1,8 @@
 #  work-pool
 
-A high-performance and flexible work pool.
+A high-performance and flexible work pool. This was built specifically to address the specific needs of @probedjs/testing.
 
 - Works with both CommonJS and ECMAScript modules.
-- Supports task discovery.
 - Heuristic-based task assignment.
 - Supports both synchronous and asynchronous tasks.
 - Work stealing.
@@ -12,12 +11,13 @@ A high-performance and flexible work pool.
 
 ### Entrypoint module
 
-In order to queue and perform tasks, you need an entrypoint module. Any module that exports a `processTask` (async or not) function will do.
+In order to queue and perform tasks, you need an entrypoint module. Any module that exports a function (async or not) as `workerEntrypoint` will do.
 
 ```javascript
 // MyWorker.js
-export const processTask = (task) => {
-  return `Hello, ${task}!`;
+export const workerEntrypoint = (taskArg) => {
+    return `Hello, ${taskArg}!`;
+  },
 };
 ```
 
@@ -38,53 +38,61 @@ const main = async () => {
 main();
 ```
 
-In Typescript, passing the entrypoint to the Workpool will get you clean typings:
+In Typescript, passing the entrypoint to the Workpool will get you clean typings. You still need to pass the
+worker module's path, so that it can be loaded from workers.
 
 ```typescript
 import { WorkerPool } from '@probedjs/work-pool';
-import { processTask } from './MyWorker'
+import { workerEntrypoint } from './MyWorker'
 
 const main = async () => {
-  const pool = new WorkerPool('MyModule.js', { entryPoint: processTask });
+  const pool = new WorkerPool('MyModule.js', { entryPoint: workerEntrypoint });
 
 //...
 ```
+### Init and teardown
 
-### Discovering work
-
-Sometimes, new work will be discovered while processing a task. The second parameter to `processTask()` is a *proxy* to the work pool that can be used to announce such work:
+You can also register lifetime callbacks for the worker. These functions will be called once per worker.
 
 ```javascript
-export const processTask = (task, workPool) => {
-
-  if(task.length > 1) {
-      workPool.addTask(task.slice(0, -1));
-  }
-
-  return `Hello, ${task}!`;
+export const workerEntrypoint = (taskArg) => {
+  return `Hello, ${taskArg}!`;
 };
+
+workerEntrypoint.onWorkerStart = (client) => {}
+workerEntrypoint.onWorkerExit = (client) => {}
 ```
 
-### Listening to events
+### Sending and receiving messages
 
-Because of task discovery, it's sometimes more convenient to ignore the promises returned by `addTask()` and rely on events instead.
+On top of dispatching tasks, messages can be send to and from workers.
 
 ```javascript
 import { WorkerPool } from '@probedjs/work-pool';
 
-const main = async () => {
-  const pool = new WorkerPool('MyWorker.js');
+export const workerEntrypoint = (taskArg, client) => {
+  client.postMessageToPool("starting", taskArg);
+  return `Hello, ${taskArg}!`;
+};
 
-  pool.on('task-complete', (err, result, task) => {
-    if (!err) {
-      console.log(result);
-    }
+workerEntrypoint.onWorkerStart = (client) => {
+  client.onMessage("hi", (contents, client)=>{
+    console.log(`pool says hi: ${contents}`);
+  })
+}
+
+const main = async () => {
+  const pool = new WorkerPool(import.meta.url);
+
+  pool.onMessage("starting", (content, origin) => {
+    console.log(`got starting message ${content} from worker ${origin}`);
   });
 
+
   pool.addTask("joe");
-  pool.addTask("jack");
-  pool.addTask("Will");
-  pool.addTask("Averell");
+
+  // Send a message to every worker.
+  pool.postMessageToWorkers("Hi!");
 
   await pool.whenIdle();
 
@@ -120,9 +128,3 @@ workPool.addTask(data, {workerAffinity: 'main'});
 
 **N.B** The main thread will never have tasks assigned to it unless `workerAffinity: 'main'` is explicitely set, 
 in which case affinityStrength is implicitely `force`. 
-
-## FAQ
-
-### Why doesn't addTask() return the task when called from a worker?
-
-It technically could. However, handling this correctly in a way that doesn't risk causing deadlocks is tricky, and no one has any immediate need for it. File an issue if you need this!

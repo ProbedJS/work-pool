@@ -16,158 +16,147 @@
 
 import {
   isMainThread,
+  MessagePort,
   parentPort,
   workerData,
-  MessagePort,
 } from 'worker_threads';
 
+import { EventEmitter } from 'events';
+
 // We are currently only importing types from WorkerPool. Let's keep it this way.
-import { ITaskPool, ProcessFunc, TaskOptions } from './index.js';
+import {
+  IWorkerClient,
+  TaskOptions,
+  UserContent,
+  WorkerEntryPoint,
+} from './index.js';
 
-export interface MsgFromWorker {
-  type: 'ready' | 'task-complete' | 'task-failed' | 'task-discovered';
+import { performance } from 'perf_hooks';
+
+export const TASK_COMPLETION_TYPE = '__completion';
+export const READY_TYPE = '__ready';
+export const ADD_TASK_TYPE = '__add';
+export const EXIT_TYPE = '__exit';
+
+export interface MsgBase {
+  type: string;
 }
 
-export interface TaskCompletion<U> extends MsgFromWorker {
-  type: 'task-complete';
-  id: string;
+export interface TaskCompletion<U> {
+  id: number;
   options: TaskOptions;
 
-  result: U;
+  error?: Error;
+  result?: U;
+
+  taskCost: number;
+  pretaskCost: number;
 }
 
-export interface TaskFailure extends MsgFromWorker {
-  type: 'task-failed';
-  id: string;
-  options: TaskOptions;
-
-  error: Error;
-}
-
-export interface TaskDiscovery<T> extends MsgFromWorker {
-  type: 'task-discovered';
-
-  id: string;
-  options: TaskOptions;
-  arg: T;
-}
-
-export interface MsgToWorker {
-  type: 'add-task' | 'exit';
-}
-
-export interface AddTaskMsg<T> extends MsgToWorker {
-  type: 'add-task';
-  id: string;
+export interface AddTaskMsg<T> {
+  id: number;
   options: TaskOptions;
 
   arg: T;
+}
+
+export interface MsgMsg extends MsgBase {
+  contents: UserContent;
 }
 
 export interface WorkerConfig {
   entrypointModule: string;
   entrypointSymbol: string;
-  workerId: 'main' | number;
 }
 
-const isPromise = (v: unknown | Promise<unknown>): v is Promise<unknown> => {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    (v as Promise<unknown>).then !== undefined
-  );
-};
-
-/**
- * This class is handles both the main thread as well
- * as the worker thread.
- */
-export class TaskWorker<T, U> implements ITaskPool<T> {
-  _id: 'main' | number;
-  _nextTaskId = 0;
+export class TaskWorker<T, U> implements IWorkerClient<T> {
+  _msgEventsEmmiter: EventEmitter = new EventEmitter();
   _port: MessagePort;
-  _impl?: ProcessFunc<T, U>;
+  _impl?: WorkerEntryPoint<T, U>;
+
   constructor(config: WorkerConfig, port: MessagePort) {
-    this._id = config.workerId;
-    import(config.entrypointModule).then((entry) => {
-      this._impl = entry[config.entrypointSymbol];
-      this._port.postMessage({ type: 'ready' });
-    });
     this._port = port;
-
     port.on('message', this._recv.bind(this));
+
+    import(config.entrypointModule).then(async (entry) => {
+      this._impl = entry[config.entrypointSymbol];
+
+      if (this._impl!.onWorkerStart) {
+        await this._impl!.onWorkerStart(this);
+      }
+
+      this._port.postMessage({ type: READY_TYPE });
+    });
   }
 
-  addTask(arg: T, opts?: TaskOptions): void {
-    const options: TaskOptions = {
-      workerAffinity: this._id !== 'main' ? this._id : undefined,
-      affinityStrength: 0,
-      ...opts,
-    };
+  onMessage(
+    type: string,
+    listener: (contents: UserContent, client: IWorkerClient<T>) => void
+  ): void {
+    this._msgEventsEmmiter.on(type, listener);
+  }
 
-    const msg: TaskDiscovery<T> = {
-      type: 'task-discovered',
-      id: `${this._id}_${this._nextTaskId}`,
-      arg,
-      options,
-    };
-    this._nextTaskId += 1;
+  postMessageToPool(type: string, contents: UserContent): void {
+    const msg: MsgMsg = { type, contents };
     this._port.postMessage(msg);
   }
 
-  _postResult(id: string, options: TaskOptions, result: U): void {
-    const msg: TaskCompletion<U> = {
-      type: 'task-complete',
-      id,
-      options,
-      result,
-    };
-    this._port.postMessage(msg);
-  }
-
-  _postFailure(id: string, options: TaskOptions, error: Error): void {
-    const msg: TaskFailure = {
-      type: 'task-failed',
-      id,
-      options,
-      error,
-    };
-    this._port.postMessage(msg);
-  }
-
-  _recv(msg: MsgToWorker): void {
+  _recv(msg: MsgBase): void {
     switch (msg.type) {
-      case 'exit':
-        this._port.close();
+      case EXIT_TYPE:
+        (async () => {
+          if (this._impl!.onWorkerExit) {
+            await this._impl!.onWorkerExit(this);
+          }
+          this._port.close();
+        })();
         break;
-      case 'add-task':
-        this._receiveTask(msg as AddTaskMsg<T>);
+      case ADD_TASK_TYPE:
+        this._receiveTask((msg as unknown) as AddTaskMsg<T>);
         break;
       default:
+        this._msgEventsEmmiter.emit(msg.type, (msg as MsgMsg).contents, this);
         break;
     }
   }
 
-  _receiveTask(msg: AddTaskMsg<T>): void {
+  async _receiveTask(msg: AddTaskMsg<T>): Promise<void> {
     const { arg, options, id } = msg;
+    let taskCost = 0;
+    let pretaskCost = 0;
 
-    try {
-      const rawResult = this._impl!(arg, this);
-
-      if (isPromise(rawResult)) {
-        rawResult
-          .then((result) => {
-            this._postResult(id, options, result);
-          })
-          .catch((error) => {
-            this._postFailure(id, options, error);
-          });
-      } else {
-        this._postResult(id, options, rawResult);
-      }
-    } catch (error) {
-      this._postFailure(id, options, error);
+    if (this._impl!.preTask) {
+      const startTime = performance.now();
+      await this._impl!.preTask(arg, this);
+      pretaskCost = performance.now() - startTime;
     }
+
+    const startTime = performance.now();
+    const rawResult = this._impl!(arg, this);
+
+    rawResult
+      .then((result) => {
+        taskCost = performance.now() - startTime;
+        const resMsg: TaskCompletion<U> = {
+          options,
+          id,
+          result,
+          taskCost,
+          pretaskCost,
+        };
+        this._port.postMessage({ type: TASK_COMPLETION_TYPE, ...resMsg });
+      })
+      .catch((error) => {
+        taskCost = performance.now() - startTime;
+        const resMsg: TaskCompletion<U> = {
+          options,
+          id,
+          error,
+          taskCost,
+          pretaskCost,
+        };
+        this._port.postMessage({ type: TASK_COMPLETION_TYPE, ...resMsg });
+      });
   }
 }
 

@@ -1,0 +1,24 @@
+{
+  "name": "@probedjs/work-pool",
+  "version": "0.3.0",
+  "description": "A high-performance and flexible work pool",
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "exports": {
+    ".": {
+      "require" : "./index.cjs",
+      "import" : "./index.mjs"
+    }
+  },
+  "types": "./index.d.ts",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Francois Chabot",
+    "email": "francois.chabot.dev@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ProbedJS/work-pool.git"
+  }
+}

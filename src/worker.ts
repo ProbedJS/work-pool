@@ -25,11 +25,15 @@ import { EventEmitter } from 'events';
 
 // We are currently only importing types from WorkerPool. Let's keep it this way.
 import {
+  AddTaskMsg,
   IWorkerClient,
-  TaskOptions,
+  MsgBase,
+  MsgMsg,
+  TaskCompletion,
   UserContent,
+  WorkerConfig,
   WorkerEntryPoint,
-} from './index.js';
+} from './worker-api';
 
 import { performance } from 'perf_hooks';
 
@@ -37,37 +41,6 @@ export const TASK_COMPLETION_TYPE = '__completion';
 export const READY_TYPE = '__ready';
 export const ADD_TASK_TYPE = '__add';
 export const EXIT_TYPE = '__exit';
-
-export interface MsgBase {
-  type: string;
-}
-
-export interface TaskCompletion<U> {
-  id: number;
-  options: TaskOptions;
-
-  error?: Error;
-  result?: U;
-
-  taskCost: number;
-  pretaskCost: number;
-}
-
-export interface AddTaskMsg<T> {
-  id: number;
-  options: TaskOptions;
-
-  arg: T;
-}
-
-export interface MsgMsg extends MsgBase {
-  contents: UserContent;
-}
-
-export interface WorkerConfig {
-  entrypointModule: string;
-  entrypointSymbol: string;
-}
 
 export class TaskWorker<T, U> implements IWorkerClient<T> {
   _msgEventsEmmiter: EventEmitter = new EventEmitter();

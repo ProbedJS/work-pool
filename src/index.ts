@@ -18,48 +18,31 @@ import {
   ADD_TASK_TYPE,
   AddTaskMsg,
   EXIT_TYPE,
+  IWorkerClient,
   MsgBase,
   MsgMsg,
   READY_TYPE,
   TASK_COMPLETION_TYPE,
   TaskCompletion,
+  TaskOptions,
+  UserContent,
   WorkerConfig,
-} from './worker.js';
+  WorkerEntryPoint,
+} from './worker-api';
 
 import { performance } from 'perf_hooks';
 import { EventEmitter } from 'events';
 import os from 'os';
 import { MessagePort, Worker } from 'worker_threads';
-import workerModule from './worker-location.js';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+export { IWorkerClient, WorkerEntryPoint };
 
 /** A flat amount added to all tasks.  */
 const BASE_TASK_COST = 1;
 
 const MAIN_THREAD_ID = -1;
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type UserContent = any;
-
-/** Interface available both in the main thread and workers. */
-export interface IWorkerClient<T> {
-  postMessageToPool(type: string, contents: UserContent): void;
-  onMessage(
-    type: string,
-    handler: (contents: UserContent, client: IWorkerClient<T>) => void
-  ): void;
-}
-
-/** Options that can be passed when adding a task. */
-export interface TaskOptions {
-  /** If set, the task will run on the main thread. */
-  mainThread?: boolean;
-
-  /** A deterministic identifier for that task. Leads to better task dispatching over multiple runs. */
-  key?: string;
-
-  /** Addition info tagged onto the task. */
-  meta?: UserContent;
-}
 
 export interface IWorker {
   readonly id: number;
@@ -67,15 +50,6 @@ export interface IWorker {
 }
 
 /** Worker entrypoint */
-export interface WorkerEntryPoint<T, U> {
-  (arg: T, client: IWorkerClient<T>): Promise<U>;
-
-  /** Work performed here will count as worker overhead, and NOT as intrinsic cost. */
-  preTask?: (arg: T, client: IWorkerClient<T>) => void;
-
-  onWorkerStart?: (client: IWorkerClient<T>) => void | Promise<void>;
-  onWorkerExit?: (client: IWorkerClient<T>) => void | Promise<void>;
-}
 
 /** A task that has been added to the worker pool. */
 export interface Task<T, U> extends PromiseLike<U> {
@@ -90,9 +64,6 @@ export interface Task<T, U> extends PromiseLike<U> {
 
 /** Options that can be passed to a worker pool at construction. */
 export interface WorkerPoolOptions<T, U> {
-  /** Name of the exported symbol to use in the entrypoint module. Default: 'workerEntrypoint' */
-  entrypointSymbol: string;
-
   /** New workers are launched when the ratio of pending tasks to workers goes above this threshold. Default: 3 */
   taskPerWorker: number;
 
@@ -105,9 +76,6 @@ export interface WorkerPoolOptions<T, U> {
   /** Function that returns an estimate of the cost (in ms) associated with running a task on a given worker.*/
   inherentCostEstimator: (task: Task<T, U>) => number;
   workerCostEstimator: (task: Task<T, U>, worker: IWorker) => number;
-
-  /** Task processing's entrypoint function. */
-  entryPoint?: WorkerEntryPoint<T, U>;
 }
 
 /** A pool of worker threads dedicated to processing tasks of the (T)=>U form. */
@@ -177,7 +145,7 @@ export interface WorkerPool<T, U> {
 
 export interface WorkerPoolConstructor {
   new <T, U>(
-    entrypointModule: string,
+    entryPoint: WorkerEntryPoint<T, U>,
     opts?: Partial<WorkerPoolOptions<T, U>>
   ): WorkerPool<T, U>;
 }
@@ -259,14 +227,23 @@ abstract class Client<T, U> extends ClientBase implements IWorker {
   }
 
   abstract _onAddTask(msg: AddTaskMsg<T>): void;
+  abstract _onDispose(): void;
 
   dispose() {
+    if (this.status !== WORKER_STARTING) {
+      this._onDispose();
+    }
     this.status = WORKER_DISPOSED;
   }
 
   _ready() {
-    this.status = WORKER_READY;
-    this._flush();
+    if (this.status === WORKER_DISPOSED) {
+      this._onDispose();
+    } else {
+      this.status = WORKER_READY;
+
+      this._flush();
+    }
   }
 
   _complete(msg: TaskCompletion<U>) {
@@ -342,9 +319,8 @@ class WorkerClient<T, U> extends Client<T, U> {
     port.on('message', (msg) => this._recv(msg));
   }
 
-  dispose() {
+  _onDispose() {
     this._port.postMessage({ type: EXIT_TYPE });
-    super.dispose();
   }
 
   postMessageToWorker(type: string, contents?: UserContent): void {
@@ -352,8 +328,6 @@ class WorkerClient<T, U> extends Client<T, U> {
   }
 
   _recv(msg: MsgBase) {
-    if (this.status === WORKER_DISPOSED) return;
-
     switch (msg.type) {
       case READY_TYPE:
         this._ready();
@@ -378,14 +352,18 @@ class MainThreadClient<T, U> extends Client<T, U> implements IWorkerClient<T> {
 
     this._next = this;
     this._prev = this;
-    import(pool._entrypointModule).then(async (mod) => {
-      this._entry = mod[pool._options.entrypointSymbol];
+    this._entry = pool._entryPoint;
 
+    (async () => {
       if (this._entry!.onWorkerStart) {
         await this._entry!.onWorkerStart(this);
       }
       this._ready();
-    });
+    })();
+  }
+
+  _onDispose() {
+    // Nothing
   }
 
   onMessage(
@@ -441,18 +419,16 @@ class MainThreadClient<T, U> extends Client<T, U> implements IWorkerClient<T> {
 /** A pool of workers capable of performing work. */
 class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
   constructor(
-    entrypointModule: string,
+    entryPoint: WorkerEntryPoint<T, U>,
     opts?: Partial<WorkerPoolOptions<T, U>>
   ) {
-    this._entrypointModule = entrypointModule;
+    this._entryPoint = entryPoint;
     this._options = {
       maxWorkers: os.cpus().length,
       inherentCostEstimator: () => 0,
       workerCostEstimator: () => 0,
       workerConcurency: 2,
       taskPerWorker: 3,
-      entrypointSymbol: 'workerEntrypoint',
-
       ...opts,
     };
 
@@ -627,13 +603,19 @@ class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
 
   _launchWorker(): void {
     const data: WorkerConfig = {
-      entrypointModule: this._entrypointModule,
-      entrypointSymbol: this._options.entrypointSymbol,
+      entrypointModule: this._entryPoint.modulePath,
+      entrypointSymbol: this._entryPoint.moduleSymbol,
     };
 
+    const workerModule = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      'WORKER_FILE_NAME'
+    );
     const newClient = new WorkerClient(
       this,
-      new Worker(workerModule, { workerData: data }),
+      new Worker(workerModule, {
+        workerData: data,
+      }),
       { maxConcurency: this._options.workerConcurency },
       this._numWorkers
     );
@@ -657,7 +639,7 @@ class WorkerPoolImpl<T, U> implements WorkerPool<T, U> {
   }
 
   _options: WorkerPoolOptions<T, U>;
-  _entrypointModule: string;
+  _entryPoint: WorkerEntryPoint<T, U>;
 
   _eventsEmmiter: EventEmitter = new EventEmitter();
   _msgEventsEmmiter: EventEmitter = new EventEmitter();

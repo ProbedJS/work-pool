@@ -6,14 +6,13 @@
         "esModuleInterop": true,
         "strict": true,
         "declaration": true,
-        "module": "commonjs",
-        "outDir": "lib/cjs",
+        "module": "ESNext",
+        "outDir": "./dist",
         "target": "es2018",
         "lib": [
-            "es2018",
+            "es2018"
         ],
         "newLine": "lf",
-        "baseUrl": ".",
     },
     "files": [
         "./src/index.ts",
